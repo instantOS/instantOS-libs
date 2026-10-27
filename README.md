@@ -5,8 +5,8 @@ Cargo.lock pins the exact revision. There is no crates.io publishing workflow.
 
 ## instantos-terminal
 
-A synchronous, dependency-free Unix terminal launcher shared by instantWM,
-instantCLI and instantMENU. It supports kitty, foot/footclient, alacritty,
+A synchronous, dependency-free Unix terminal launcher shared by instantWM
+and instantCLI. It supports kitty, foot/footclient, alacritty,
 wezterm, ghostty, gnome-terminal, konsole, xterm and st. Unknown executables and
 custom wrappers are treated as accepting `--class`, `--title` and `-e`.
 Wezterm has no startup title option, so title requests are omitted for it.
@@ -88,11 +88,12 @@ instantterminal --terminal foot -- sh -c 'printf "hello\n"; read answer'
 instantterminal --ensure-default
 ```
 
-instantCLI exposes the same interface as `ins terminal`, and instantMENU as
-`instantmenu --terminal`. Both dispatch before normal CLI/UI/runtime
-initialization and exec the terminal. Scripts can use these installed binaries
-without an additional runtime package. Script entry points incur the cost of
-loading their executable; native consumers link the crate and launch directly.
+instantCLI exposes the same interface as `ins terminal`, dispatching before
+normal CLI/UI/runtime initialization and replacing itself with the terminal.
+Scripts can use this installed binary without an additional runtime package.
+Application discovery and selection belong to `ins launch`; instantMENU is a
+menu renderer and does not launch terminals. Script entry points incur the cost
+of loading their executable; native consumers link the crate and launch directly.
 Use the standalone `instantterminal` binary when the smallest script entry point
 is needed. `-e` is also accepted as a command delimiter for application-launcher
 integration. Prefer `--` in new scripts.
