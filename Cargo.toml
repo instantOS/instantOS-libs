@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/instantos-terminal"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/instantOS/instantOS-libs"
+

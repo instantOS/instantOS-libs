@@ -1,0 +1,13 @@
+[package]
+name = "instantos-terminal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared terminal selection and direct launching for instantOS"
+publish = false
+
+[[bin]]
+name = "instantterminal"
+path = "src/main.rs"
+
