@@ -273,3 +273,102 @@ fn cli_delimiter_preserves_command_flags_and_spaces() {
     assert!(parse_cli(["--title"].map(OsString::from)).is_err());
     assert!(parse_cli(["--typo"].map(OsString::from)).is_err());
 }
+
+#[test]
+fn delegated_request_round_trips_options_and_native_arguments() {
+    use std::os::unix::ffi::OsStringExt;
+    let original = Launcher::new("printf")
+        .args([
+            OsString::from("hello 'world'\n--title"),
+            OsString::from_vec(vec![0xff, b'x']),
+        ])
+        .terminal("/custom/foot")
+        .app_id("scratchpad_notes")
+        .title("Title with 'quotes' and \\slashes")
+        .working_directory("/directory with spaces")
+        .backend(Backend::Wayland);
+    let parsed = parse_cli(original.cli_args()).unwrap().unwrap();
+    assert_eq!(parsed.argv, original.argv);
+    assert_eq!(parsed.explicit, original.explicit);
+    assert_eq!(parsed.app_id, original.app_id);
+    assert_eq!(parsed.title, original.title);
+    assert_eq!(parsed.working_directory, original.working_directory);
+    assert_eq!(parsed.backend, original.backend);
+    let parsed = parse_cli(Launcher::default().cli_args()).unwrap().unwrap();
+    assert!(parsed.argv.is_empty());
+    assert!(parsed.explicit.is_none());
+}
+
+#[test]
+fn spawn_with_returns_only_successful_attempt_metadata() {
+    let dir = TestDir::new();
+    let target = dir.executable("foot", "#!/bin/sh\nexit 0\n");
+    let mut request = request();
+    request.preferred = Some(dir.0.join("absent").into_os_string());
+    request.alias = Some(target.clone());
+    let mut attempts = 0;
+    let (mut child, (program, successful_attempt)) = request
+        .spawn_with(|command| {
+            attempts += 1;
+            (command.get_program().to_owned(), attempts)
+        })
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(program, target.into_os_string());
+    assert_eq!(successful_attempt, 2);
+    assert_eq!(attempts, 2);
+}
+
+#[test]
+fn working_directory_is_applied_without_a_shell_cd_command() {
+    let dir = TestDir::new();
+    let terminal = dir.executable("foot", "#!/bin/sh\n/bin/pwd\n");
+    let launcher = Launcher::new("printf")
+        .terminal(terminal)
+        .working_directory(&dir.0);
+    let (child, ()) = launcher
+        .spawn_with(|command| {
+            command.stdout(Stdio::piped());
+        })
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, format!("{}\n", dir.0.display()).as_bytes());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_children_are_reaped_out_of_order() {
+    let dir = TestDir::new();
+    let slow = dir.executable(
+        "slow",
+        "#!/bin/sh\nwhile [ ! -e \"$2\" ]; do /bin/sleep 0.01; done\n",
+    );
+    let gate = dir.0.join("allow-exit");
+    let fast = dir.executable("fast", "#!/bin/sh\nexit 0\n");
+    let slow_pid = Launcher::new(gate.as_os_str())
+        .terminal(slow)
+        .spawn_detached()
+        .unwrap();
+    let fast_pid = Launcher::default().terminal(fast).spawn_detached().unwrap();
+    let process_exists = |pid: u32| Path::new("/proc").join(pid.to_string()).exists();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_exists(fast_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let fast_reaped = !process_exists(fast_pid);
+    let slow_running = process_exists(slow_pid);
+    fs::write(&gate, "exit").unwrap();
+    assert!(
+        fast_reaped,
+        "finished child must be reaped, not left as a zombie"
+    );
+    assert!(
+        slow_running,
+        "reaping must not block behind a longer-lived child"
+    );
+    while process_exists(slow_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!process_exists(slow_pid));
+}

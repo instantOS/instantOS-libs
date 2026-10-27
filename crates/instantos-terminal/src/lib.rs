@@ -12,7 +12,7 @@ use std::io;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,10 +120,10 @@ pub struct Launcher {
     preferred: Option<OsString>,
     alias: Option<PathBuf>,
     backend: Backend,
-    pub argv: Vec<OsString>,
-    pub app_id: Option<OsString>,
-    pub title: Option<OsString>,
-    pub working_directory: Option<PathBuf>,
+    argv: Vec<OsString>,
+    app_id: Option<OsString>,
+    title: Option<OsString>,
+    working_directory: Option<PathBuf>,
 }
 
 impl Default for Launcher {
@@ -173,8 +173,39 @@ impl Launcher {
         self
     }
 
-    pub fn launch(&self) -> io::Result<()> {
-        self.spawn().map(|_| ())
+    pub fn working_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(directory.into());
+        self
+    }
+
+    /// Arguments for delegating this request to the shared CLI interface.
+    /// The receiving process selects its terminal at execution time. Selection
+    /// environment is inherited rather than serialized as a stale snapshot.
+    pub fn cli_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        for (flag, value) in [
+            ("--terminal", self.explicit.as_deref()),
+            ("--app-id", self.app_id.as_deref()),
+            ("--title", self.title.as_deref()),
+            (
+                "--working-directory",
+                self.working_directory.as_deref().map(Path::as_os_str),
+            ),
+        ] {
+            if let Some(value) = value {
+                args.extend([OsString::from(flag), value.to_owned()]);
+            }
+        }
+        args.extend([
+            OsString::from("--backend"),
+            OsString::from(match self.backend {
+                Backend::Wayland => "wayland",
+                Backend::X11 => "x11",
+            }),
+        ]);
+        args.push("--".into());
+        args.extend(self.argv.iter().cloned());
+        args
     }
 
     /// An explicit override is strict: errors are reported, without selecting a
@@ -319,16 +350,36 @@ impl Launcher {
     }
 
     pub fn spawn(&self) -> io::Result<Child> {
-        self.spawn_with(|_| {})
+        self.spawn_with(|_| {}).map(|(child, ())| child)
     }
 
-    /// Configure stdio, environment, process groups, etc. for every attempted
-    /// executable. The callback must not launch the command itself.
-    pub fn spawn_with(&self, mut configure: impl FnMut(&mut Command)) -> io::Result<Child> {
+    /// Configure every attempt, returning the successful child's metadata.
+    /// The caller owns the child and must wait for it or arrange reaping.
+    pub fn spawn_with<T>(
+        &self,
+        mut configure: impl FnMut(&mut Command) -> T,
+    ) -> io::Result<(Child, T)> {
         self.attempt(|command| {
-            configure(command);
-            command.spawn()
+            let metadata = configure(command);
+            command.spawn().map(|child| (child, metadata))
         })
+    }
+
+    /// Start an independent process group with null stdio. A lazy, shared
+    /// worker reaps children without blocking the caller or polling when idle.
+    /// Returns the process ID; use `spawn` when you need ownership of the child.
+    pub fn spawn_detached(&self) -> io::Result<u32> {
+        let reaper = reaper::shared()?;
+        let (child, ()) = self.spawn_with(|command| {
+            command
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        })?;
+        let pid = child.id();
+        reaper.watch(child);
+        Ok(pid)
     }
 
     pub fn status(&self) -> io::Result<ExitStatus> {
@@ -450,7 +501,7 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "Usage: instantterminal [--terminal EXECUTABLE] [--app-id ID] [--title TITLE] [--working-directory DIR] [-- COMMAND ARG...]\n       instantterminal --ensure-default\nTERMINAL overrides the instantOS default alias. Explicit --terminal never falls back."
+                    "Usage: instantterminal [--terminal EXECUTABLE] [--app-id ID] [--title TITLE] [--working-directory DIR] [--backend wayland|x11] [-- COMMAND ARG...]\n       instantterminal --ensure-default\nTERMINAL overrides the instantOS default alias. Explicit --terminal never falls back."
                 );
                 return Ok(None);
             }
@@ -464,7 +515,7 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
                 request.argv.extend(args);
                 break;
             }
-            Some("--terminal" | "--app-id" | "--class" | "--title" | "--working-directory") => {
+            Some("--terminal" | "--app-id" | "--title" | "--working-directory" | "--backend") => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -473,7 +524,19 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
                 })?;
                 match arg.to_str() {
                     Some("--terminal") => request.explicit = Some(value),
-                    Some("--app-id" | "--class") => request.app_id = Some(value),
+                    Some("--app-id") => request.app_id = Some(value),
+                    Some("--backend") => {
+                        request.backend = match value.to_str() {
+                            Some("wayland") => Backend::Wayland,
+                            Some("x11") => Backend::X11,
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "backend must be wayland or x11",
+                                ));
+                            }
+                        }
+                    }
                     Some("--title") => request.title = Some(value),
                     _ => request.working_directory = Some(value.into()),
                 }
@@ -493,6 +556,8 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
     }
     Ok(Some(request))
 }
+
+mod reaper;
 
 #[cfg(test)]
 mod tests;

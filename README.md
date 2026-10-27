@@ -23,14 +23,25 @@ Launcher::new("nvim")
     .arg("notes with spaces.md")
     .app_id("scratchpad_notes")
     .title("Notes")
-    .launch()?;
+    .spawn_detached()?;
 # Ok::<(), std::io::Error>(())
 ```
 
 Use `Launcher::default()` for an ordinary terminal window. `spawn_with` lets a
 window manager supply activation environment, process-group and stdio policy
-for every attempt while retaining ownership of the resulting child.
+for every attempt and returns `(Child, metadata)` for the successful attempt.
+`spawn` returns an owned child, which the caller must wait for or arrange to reap.
 `status` waits for the terminal; `exec` replaces the caller process.
+`spawn_detached` returns a PID, creates an independent process group with null
+stdio, and transfers child ownership to one shared reaper worker. The worker
+sleeps when idle; it is not a separate daemon or one thread per terminal.
+There is deliberately no `launch` method that silently drops a child handle.
+
+Request fields are private. Use `.working_directory(path)` to choose a directory
+without a shell command, along with `.args`, `.app_id`, `.title`, `.terminal`
+and `.backend`. `cli_args()` serializes the same request for delegation through
+`ins terminal` or another shared CLI entry point. Only the receiving process
+selects the terminal; callers do not reconstruct terminal-specific flags.
 
 Selection order:
 
