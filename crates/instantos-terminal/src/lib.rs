@@ -15,48 +15,55 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Backend {
-    Wayland,
-    X11,
+const CANDIDATES: &[&str] = &[
+    "kitty",
+    "ghostty",
+    "wezterm",
+    "foot",
+    "alacritty",
+    "gnome-terminal",
+    "konsole",
+    "xterm",
+    "st",
+];
+const X11_CANDIDATES: &[&str] = &[
+    "kitty",
+    "ghostty",
+    "wezterm",
+    "alacritty",
+    "gnome-terminal",
+    "konsole",
+    "xterm",
+    "st",
+];
+const DISPLAY_VARIABLES: &[&str] = &["WAYLAND_DISPLAY", "WAYLAND_SOCKET"];
+
+fn candidates_with_environment(
+    mut variable: impl FnMut(&str) -> Option<OsString>,
+) -> &'static [&'static str] {
+    if DISPLAY_VARIABLES
+        .iter()
+        .any(|key| variable(key).is_some_and(|value| !value.is_empty()))
+    {
+        CANDIDATES
+    } else {
+        X11_CANDIDATES
+    }
 }
 
-impl Backend {
-    pub fn from_environment() -> Self {
-        if env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
-            || env::var("INSTANTWM_BACKEND").is_ok_and(|backend| backend.starts_with("wayland"))
-        {
-            Self::Wayland
-        } else {
-            Self::X11
-        }
-    }
+/// Candidates for explicit settings/setup selection in the current environment.
+/// Ordinary launches do not call this function or inspect the display session.
+pub fn candidates() -> &'static [&'static str] {
+    candidates_with_environment(|key| env::var_os(key))
+}
 
-    pub const fn candidates(self) -> &'static [&'static str] {
-        match self {
-            Self::Wayland => &[
-                "kitty",
-                "ghostty",
-                "wezterm",
-                "foot",
-                "alacritty",
-                "gnome-terminal",
-                "konsole",
-                "xterm",
-                "st",
-            ],
-            Self::X11 => &[
-                "kitty",
-                "ghostty",
-                "wezterm",
-                "alacritty",
-                "gnome-terminal",
-                "konsole",
-                "xterm",
-                "st",
-            ],
-        }
-    }
+fn command_candidates(command: &Command) -> &'static [&'static str] {
+    candidates_with_environment(|key| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.map(OsStr::to_owned))
+    })
 }
 
 /// The established instantOS alias. Kept independent of XDG_CONFIG_HOME for
@@ -119,7 +126,6 @@ pub struct Launcher {
     explicit: Option<OsString>,
     preferred: Option<OsString>,
     alias: Option<PathBuf>,
-    backend: Backend,
     argv: Vec<OsString>,
     app_id: Option<OsString>,
     title: Option<OsString>,
@@ -132,7 +138,6 @@ impl Default for Launcher {
             explicit: None,
             preferred: env::var_os("TERMINAL").filter(|value| !value.is_empty()),
             alias: default_alias(),
-            backend: Backend::from_environment(),
             argv: Vec::new(),
             app_id: None,
             title: None,
@@ -196,13 +201,6 @@ impl Launcher {
                 args.extend([OsString::from(flag), value.to_owned()]);
             }
         }
-        args.extend([
-            OsString::from("--backend"),
-            OsString::from(match self.backend {
-                Backend::Wayland => "wayland",
-                Backend::X11 => "x11",
-            }),
-        ]);
         args.push("--".into());
         args.extend(self.argv.iter().cloned());
         args
@@ -215,12 +213,7 @@ impl Launcher {
         self
     }
 
-    pub fn backend(mut self, backend: Backend) -> Self {
-        self.backend = backend;
-        self
-    }
-
-    fn programs(&self) -> impl Iterator<Item = &OsStr> {
+    fn programs(&self) -> impl Iterator<Item = (&OsStr, bool)> {
         let explicit = self.explicit.as_deref();
         let preferred = self.preferred.as_deref().filter(|_| explicit.is_none());
         let alias = self
@@ -228,19 +221,15 @@ impl Launcher {
             .as_deref()
             .map(Path::as_os_str)
             .filter(|alias| explicit.is_none() && Some(*alias) != preferred);
-        let candidates =
-            self.backend
-                .candidates()
-                .iter()
-                .map(OsStr::new)
-                .filter(move |candidate| {
-                    explicit.is_none() && Some(*candidate) != preferred && Some(*candidate) != alias
-                });
+        let automatic = CANDIDATES.iter().map(OsStr::new).filter(move |candidate| {
+            explicit.is_none() && Some(*candidate) != preferred && Some(*candidate) != alias
+        });
         explicit
             .into_iter()
             .chain(preferred)
             .chain(alias)
-            .chain(candidates)
+            .map(|program| (program, false))
+            .chain(automatic.map(|program| (program, true)))
     }
 
     /// Build arguments for a known executable. This performs no PATH search.
@@ -323,12 +312,40 @@ impl Launcher {
         cmd
     }
 
-    fn attempt<T>(&self, mut launch: impl FnMut(&mut Command) -> io::Result<T>) -> io::Result<T> {
+    fn attempt<T, M>(
+        &self,
+        mut configure: impl FnMut(&mut Command) -> M,
+        mut launch: impl FnMut(&mut Command) -> io::Result<T>,
+    ) -> io::Result<(T, M)> {
         let mut tried = Vec::new();
-        for program in self.programs() {
+        let mut automatic_candidates: Option<&[&str]> = None;
+        for (program, automatic) in self.programs() {
+            if automatic
+                && automatic_candidates.is_some_and(|candidates| {
+                    !candidates
+                        .iter()
+                        .any(|candidate| OsStr::new(candidate) == program)
+                })
+            {
+                continue;
+            }
             let mut command = self.command_for(program);
+            if automatic && automatic_candidates.is_none() {
+                // Snapshot only the display variables, only when fallback is reached.
+                // Explicit entries let get_envs reflect env_clear/env_remove as well
+                // as overrides applied by configure, without probing any sockets.
+                for key in DISPLAY_VARIABLES {
+                    if let Some(value) = env::var_os(key) {
+                        command.env(key, value);
+                    }
+                }
+            }
+            let metadata = configure(&mut command);
+            if automatic && automatic_candidates.is_none() {
+                automatic_candidates = Some(command_candidates(&command));
+            }
             match launch(&mut command) {
-                Ok(result) => return Ok(result),
+                Ok(result) => return Ok((result, metadata)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     tried.push(program.to_string_lossy().into_owned());
                 }
@@ -357,12 +374,9 @@ impl Launcher {
     /// The caller owns the child and must wait for it or arrange reaping.
     pub fn spawn_with<T>(
         &self,
-        mut configure: impl FnMut(&mut Command) -> T,
+        configure: impl FnMut(&mut Command) -> T,
     ) -> io::Result<(Child, T)> {
-        self.attempt(|command| {
-            let metadata = configure(command);
-            command.spawn().map(|child| (child, metadata))
-        })
+        self.attempt(configure, |command| command.spawn())
     }
 
     /// Start an independent process group with null stdio. A lazy, shared
@@ -388,7 +402,7 @@ impl Launcher {
 
     /// Replace this process; a successfully executed terminal never returns.
     pub fn exec(&self) -> io::Error {
-        self.attempt::<()>(|command| Err(command.exec()))
+        self.attempt::<(), ()>(|_| {}, |command| Err(command.exec()))
             .unwrap_err()
     }
 }
@@ -448,7 +462,7 @@ pub fn set_default(alias: &Path, executable: &Path) -> io::Result<()> {
 
 /// Preserve existing files/wrappers and live symlinks; fill absent or dangling
 /// aliases. This operation is intentionally never called by the launch path.
-pub fn ensure_default(alias: &Path, backend: Backend) -> io::Result<()> {
+pub fn ensure_default(alias: &Path) -> io::Result<()> {
     match fs::symlink_metadata(alias) {
         Ok(metadata) if metadata.file_type().is_symlink() => match fs::metadata(alias) {
             Ok(_) => return Ok(()),
@@ -463,7 +477,7 @@ pub fn ensure_default(alias: &Path, backend: Backend) -> io::Result<()> {
     let target = env::var_os("TERMINAL")
         .and_then(find_executable)
         .filter(|target| target != alias)
-        .or_else(|| backend.candidates().iter().find_map(find_executable));
+        .or_else(|| candidates().iter().find_map(find_executable));
     match target {
         Some(target) => set_default(alias, &target),
         None => Err(io::Error::new(
@@ -501,21 +515,21 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "Usage: instantterminal [--terminal EXECUTABLE] [--app-id ID] [--title TITLE] [--working-directory DIR] [--backend wayland|x11] [-- COMMAND ARG...]\n       instantterminal --ensure-default\nTERMINAL overrides the instantOS default alias. Explicit --terminal never falls back."
+                    "Usage: instantterminal [--terminal EXECUTABLE] [--app-id ID] [--title TITLE] [--working-directory DIR] [-- COMMAND ARG...]\n       instantterminal --ensure-default\nTERMINAL overrides the instantOS default alias. Explicit --terminal never falls back."
                 );
                 return Ok(None);
             }
             Some("--ensure-default") => {
                 let alias = default_alias()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-                ensure_default(&alias, Backend::from_environment())?;
+                ensure_default(&alias)?;
                 return Ok(None);
             }
             Some("--" | "-e") => {
                 request.argv.extend(args);
                 break;
             }
-            Some("--terminal" | "--app-id" | "--title" | "--working-directory" | "--backend") => {
+            Some("--terminal" | "--app-id" | "--title" | "--working-directory") => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -525,18 +539,6 @@ fn parse_cli(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Laun
                 match arg.to_str() {
                     Some("--terminal") => request.explicit = Some(value),
                     Some("--app-id") => request.app_id = Some(value),
-                    Some("--backend") => {
-                        request.backend = match value.to_str() {
-                            Some("wayland") => Backend::Wayland,
-                            Some("x11") => Backend::X11,
-                            _ => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "backend must be wayland or x11",
-                                ));
-                            }
-                        }
-                    }
                     Some("--title") => request.title = Some(value),
                     _ => request.working_directory = Some(value.into()),
                 }

@@ -38,8 +38,8 @@ sleeps when idle; it is not a separate daemon or one thread per terminal.
 There is deliberately no `launch` method that silently drops a child handle.
 
 Request fields are private. Use `.working_directory(path)` to choose a directory
-without a shell command, along with `.args`, `.app_id`, `.title`, `.terminal`
-and `.backend`. `cli_args()` serializes the same request for delegation through
+without a shell command, along with `.args`, `.app_id`, `.title` and `.terminal`.
+`cli_args()` serializes the same request for delegation through
 `ins terminal` or another shared CLI entry point. Only the receiving process
 selects the terminal; callers do not reconstruct terminal-specific flags.
 
@@ -49,7 +49,8 @@ Selection order:
    falls back to a different terminal.
 2. `$TERMINAL`, interpreted as one executable name or path, without shell parsing.
 3. `$HOME/.config/instantos/default/terminal`, the existing instantOS alias.
-4. Backend-compatible fallback candidates. Automatic X11 selection excludes foot.
+4. Fallback candidates compatible with the child environment. Foot is included only when a Wayland
+   display or socket is available in the environment passed to the child.
 
 A successful plain launch performs no config read, availability probe or profile
 lookup and starts no helper. The kernel resolves the alias during execution.
@@ -57,8 +58,13 @@ Requests containing command arguments, app ID or title need the terminal's
 argument dialect: absolute/relative executable paths are resolved with
 `read_link`, without a preliminary availability check or canonicalization.
 Selection is evaluated for each launch; changing the alias takes effect without
-restarting the session. No daemon, filesystem watcher or environment cache is
-required.
+restarting the session. Display detection runs once per automatic selection,
+only after configured choices fail to execute. It uses the effective child
+environment after the spawn callback, including removed or cleared variables.
+Successful configured launches do not inspect display variables. Detection only
+reads environment variables; it does not probe files, sockets or processes.
+There is no public backend enum, backend builder or CLI flag, and no global
+session cache.
 
 Only execution errors with `ErrorKind::NotFound` trigger fallback. Permission
 errors and child exit statuses are returned directly. A terminal which starts
